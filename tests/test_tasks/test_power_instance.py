@@ -226,7 +226,13 @@ def test_pc_wait_fight_recovers_optional_speed_capture_only(monkeypatch, failure
             return next(victories)
         return target == instance.PAUSE
 
-    auto = Mock(find_element=Mock(side_effect=find), take_screenshot=Mock(side_effect=failure))
+    def take_shot(*_args, **kwargs):
+        # 循环顶部的整帧截图必须成功；只有倍速控件的小区域截图按用例要求失败。
+        if "crop" in kwargs:
+            raise failure
+        return "frame", (0, 0, 1920, 1080), 1
+
+    auto = Mock(find_element=Mock(side_effect=find), take_screenshot=Mock(side_effect=take_shot))
     monkeypatch.setattr(instance, "auto", auto)
     monkeypatch.setattr(instance, "game_option_enabled", lambda *_args: True)
     monkeypatch.setattr(instance.time, "sleep", Mock())
@@ -237,7 +243,7 @@ def test_pc_wait_fight_recovers_optional_speed_capture_only(monkeypatch, failure
         with pytest.raises(type(failure)) as stopped:
             instance.Instance.wait_fight()
         assert stopped.value is failure
-    auto.take_screenshot.assert_called_once()
+    assert auto.take_screenshot.call_count >= 1
     auto.click_element.assert_not_called()
     auto.press_key.assert_not_called()
 
@@ -788,3 +794,57 @@ def test_universe_bonus_delegates_to_immersifier_only_power_task(monkeypatch, en
 
     power.Power.process.assert_called_once_with(ORNAMENT, "浴火钢心", immersifier_only=True)
     auto.get_single_line_text.assert_not_called()
+
+def _ocr_auto(ocr_result, find_result=False):
+    """构造只按 OCR / 模板结果作答的 auto 替身。"""
+    auto = Mock()
+    auto.ocr_result = ocr_result
+    auto.find_element.return_value = find_result
+    return auto
+
+
+def test_wait_fight_accepts_victory_from_ocr_when_template_fails(monkeypatch):
+    """2560x1440 降采样后「再来一次」模板只有 0.8558（低于 0.88 阈值），OCR 必须补上。"""
+    auto = _ocr_auto([((1213, 963, 1305, 983), ("再来一次", 0.96))])
+    monkeypatch.setattr(instance, "auto", auto)
+    monkeypatch.setattr(instance.time, "sleep", Mock())
+
+    assert instance.Instance.wait_fight()
+
+    # OCR 先命中即短路，本轮不再为「再来一次」跑模板匹配
+    assert not any(entry.args[0] == instance.FIGHT_AGAIN for entry in auto.find_element.call_args_list)
+
+
+def test_wait_fight_detects_defeat_from_ocr(monkeypatch):
+    auto = _ocr_auto([((984, 168, 1047, 230), ("战斗失败", 0.94))])
+    monkeypatch.setattr(instance, "auto", auto)
+    monkeypatch.setattr(instance.time, "sleep", Mock())
+
+    assert instance.Instance.wait_fight() is False
+
+
+def test_wait_fight_falls_back_to_template_when_ocr_returns_nothing(monkeypatch):
+    """OCR 一帧都没认出文字时，仍按模板判定，避免识别链路整体失效。"""
+    auto = _ocr_auto([])
+    auto.find_element.side_effect = lambda target, *_args, **_kwargs: target == instance.FIGHT_FAIL
+    monkeypatch.setattr(instance, "auto", auto)
+    monkeypatch.setattr(instance.time, "sleep", Mock())
+
+    assert instance.Instance.wait_fight() is False
+
+    targets = [entry.args[0] for entry in auto.find_element.call_args_list]
+    assert instance.FIGHT_AGAIN in targets
+    assert instance.FIGHT_FAIL in targets
+
+
+def test_wait_fight_only_checks_exit_template_when_awaiting_repeat(monkeypatch):
+    """第一场战斗不需要「退出关卡」，不应为了它多跑一次模板匹配。"""
+    auto = _ocr_auto([])
+    auto.find_element.side_effect = lambda target, *_args, **_kwargs: target == instance.FIGHT_AGAIN
+    monkeypatch.setattr(instance, "auto", auto)
+    monkeypatch.setattr(instance.time, "sleep", Mock())
+
+    assert instance.Instance.wait_fight(repeated=False)
+
+    targets = [entry.args[0] for entry in auto.find_element.call_args_list]
+    assert instance.FIGHT_EXIT not in targets

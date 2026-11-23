@@ -366,6 +366,26 @@ class Instance:
         screen.change_to("main", max_recursion=1)
 
     @staticmethod
+    def _ocr_available():
+        """当前帧的 OCR 结果是否可用；识别失败时 ocr_result 为空。"""
+        return isinstance(getattr(auto, "ocr_result", None), (list, tuple)) and bool(auto.ocr_result)
+
+    @staticmethod
+    def _ocr_finds(*keywords):
+        """在当前帧的 OCR 结果里检查是否出现任一关键词。"""
+        result = getattr(auto, "ocr_result", None)
+        if not isinstance(result, (list, tuple)):
+            return False
+        for entry in result:
+            try:
+                text = entry[1][0]
+            except (IndexError, TypeError):
+                continue
+            if any(keyword in text for keyword in keywords):
+                return True
+        return False
+
+    @staticmethod
     def wait_fight(*, repeated=False):
         deadline = time.monotonic() + ENTRY_TIMEOUT
         in_battle = False
@@ -373,14 +393,28 @@ class Instance:
         next_controls = 0.0
         reconnects = 0
         while time.monotonic() < deadline:
-            victory = auto.find_element(FIGHT_AGAIN, "image", 0.88)
+            # 结算按钮是小尺寸模板（fight_again.png 只有 92x20），对字体渲染和抗锯齿很敏感，
+            # 实测相似度 0.8558 逼近 0.88 阈值，容易漏判。文字识别对字形变化更稳健，
+            # 而且一帧只跑一次 OCR 就能同时回答三个判定，比三个模板各跑一遍全屏匹配更省。
+            auto.take_screenshot()
+            auto.perform_ocr()
+            ocr_available = Instance._ocr_available()
+
+            # 「再来一次」决定这场算不算赢，文字与模板都查，任一命中即算胜利。
+            victory = Instance._ocr_finds("再来一次")
+            if not victory:
+                victory = bool(auto.find_element(FIGHT_AGAIN, "image", 0.88, take_screenshot=False))
             if victory and (not repeated or in_battle):
                 return True
             awaiting_repeat = repeated and not in_battle
-            result_visible = victory or (awaiting_repeat and auto.find_element(
-                FIGHT_EXIT, "image", 0.9, take_screenshot=False,
-            ))
-            if auto.find_element(FIGHT_FAIL, "image", 0.9, take_screenshot=False):
+            exit_visible = Instance._ocr_finds("退出关卡")
+            if awaiting_repeat and not exit_visible and not ocr_available:
+                exit_visible = bool(auto.find_element(FIGHT_EXIT, "image", 0.9, take_screenshot=False))
+            result_visible = victory or (awaiting_repeat and exit_visible)
+            fail_visible = Instance._ocr_finds("战斗失败")
+            if not fail_visible and not ocr_available:
+                fail_visible = bool(auto.find_element(FIGHT_FAIL, "image", 0.9, take_screenshot=False))
+            if fail_visible:
                 return False
             now = time.monotonic()
             if now >= next_popup_check:
